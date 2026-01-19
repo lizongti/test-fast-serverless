@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "test-step-functions"
+resolve_s3 = true
+s3_prefix = "test-step-functions"
+capabilities = "CAPABILITY_IAM"
+disable_rollback = false
+parameter_overrides = "StageName=\"dev\""
+image_repositories = ["DispatcherFunction=255491288557.dkr.ecr.ap-east-1.amazonaws.com/testserverlessde443db3/dispatcherfunction4973523frepo", "WorkerFunction=255491288557.dkr.ecr.ap-east-1.amazonaws.com/testserverlessde443db3/workerfunction5fd3ab0brepo", "ApiFunction=255491288557.dkr.ecr.ap-east-1.amazonaws.com/teststepfunctions229e1732/apifunction51503098repo"]
+confirm_changeset = true
+
+[default.global.parameters]
+region = "ap-east-1"

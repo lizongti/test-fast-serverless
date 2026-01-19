@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: TestServerlessSystem - SQS triggers Worker; Dispatcher sends messages; timings returned via Step Functions callback output
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - arm64
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+Resources:
+  TestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: TestServerlessApi
+      StageName: !Ref StageName
+
+  TestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+
+  TestTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  DispatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DispatcherSqsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt TestQueue.Arn
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkerSqsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt TestQueue.Arn
+
+        - PolicyName: WorkerStepFunctionsCallback
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: "*"
+
+        - PolicyName: WorkerDdbConditionalUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt TestTable.Arn
+
+  DispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt DispatcherRole.Arn
+      PackageType: Image
+      Environment:
+        Variables:
+          REQUEST_QUEUE_URL: !Ref TestQueue
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: .
+      DockerTag: dispatcher
+      DockerBuildArgs:
+        GO_MAIN: ./cmd/dispatcher
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt WorkerRole.Arn
+      PackageType: Image
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TestTable
+      Events:
+        QueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TestQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: .
+      DockerTag: worker
+      DockerBuildArgs:
+        GO_MAIN: ./cmd/worker
+
+  TestStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatcherFunction
+      Definition:
+        Comment: Invoke Dispatcher; Dispatcher enqueues taskToken; Worker callbacks to resume
+        StartAt: Dispatch
+        States:
+          Dispatch:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+            Parameters:
+              FunctionName: ${DispatcherFunctionArn}
+              Payload:
+                taskToken.$: $$.Task.Token
+                input.$: $
+            OutputPath: $
+            TimeoutSeconds: 28
+            End: true
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !GetAtt DispatcherFunction.Arn
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiStepFunctionsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref TestStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                Resource: "*"
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt ApiRole.Arn
+      PackageType: Image
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref TestStateMachine
+      Events:
+        Run:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TestApi
+            Path: /run
+            Method: POST
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: .
+      DockerTag: api
+      DockerBuildArgs:
+        GO_MAIN: ./cmd/api
+
+Outputs:
+  QueueUrl:
+    Value: !Ref TestQueue
+
+  TableName:
+    Value: !Ref TestTable
+  DispatcherFunctionName:
+    Value: !Ref DispatcherFunction
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+
+  StateMachineArn:
+    Value: !Ref TestStateMachine
+
+  ApiEndpoint:
+    Value: !Sub "https://${TestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/run"

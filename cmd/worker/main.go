@@ -1,8 +1,8 @@
 // Lambda #2 (Worker)
 //
-// 作用：由 SQS 触发消费请求消息，并回调 Step Functions（SendTaskSuccess/Failure）。
+// 作用：由 Push SQS 触发消费请求消息，并把处理结果发送到 Receive SQS（回调消息）。
 // 触发方式：SQS Event Source Mapping（RequestQueue -> Lambda）。
-// 输出：通过 callback Output（JSON）把各阶段时间戳传回上游（Test/ApiFunction）。
+// 输出：通过 Receive SQS 消息（JSON）把各阶段时间戳传回上游（Dispatcher API）。
 //
 // 对应 SAM 资源：template.yaml 中的 WorkerFunction
 package main
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,34 +22,32 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/sfn"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 type msgBody struct {
-	ID           string `json:"id"`
+	ID                string `json:"id"`
 	SendUnixNano      int64  `json:"sendUnixNano"`
 	SendStartUnixNano int64  `json:"sendStartUnixNano"`
 	RunID             string `json:"runId"`
-	TaskToken         string `json:"taskToken"`
 }
 
-type callbackOutput struct {
-	ID        string `json:"id"`
-	RunID     string `json:"runId"`
-	QueueName string `json:"queueName"`
-	Region    string `json:"region"`
+type callbackMessage struct {
+	ID    string `json:"id"`
+	RunID string `json:"runId"`
+
+	Region           string `json:"region"`
+	PushQueueName    string `json:"pushQueueName"`
+	ReceiveQueueName string `json:"receiveQueueName"`
 
 	SendUnixNano      int64 `json:"sendUnixNano"`
 	SendStartUnixNano int64 `json:"sendStartUnixNano"`
-	ReceiveUnixNano   int64 `json:"receiveUnixNano"`
-	WorkerDoneUnixNano int64 `json:"workerDoneUnixNano"`
 
-	// 回调请求发起的时间戳（注意：callback 的“结束时间”无法通过本次 Output 回传）。
-	CallbackRequestUnixNano int64 `json:"callbackRequestUnixNano"`
+	WorkerReceiveUnixNano     int64 `json:"workerReceiveUnixNano"`
+	WorkerDoneUnixNano        int64 `json:"workerDoneUnixNano"`
+	CallbackSendStartUnixNano int64 `json:"callbackSendStartUnixNano"`
+	CallbackSendEndUnixNano   int64 `json:"callbackSendEndUnixNano"`
 
 	SqsSentTimestampMs         int64 `json:"sqsSentTimestampMs"`
 	SqsFirstReceiveTimestampMs int64 `json:"sqsFirstReceiveTimestampMs"`
@@ -59,8 +58,7 @@ var (
 	initOnce sync.Once
 	initErr  error
 
-	sfnClient *sfn.Client
-	ddbClient *dynamodb.Client
+	sqsClient *sqs.Client
 	region    string
 )
 
@@ -72,23 +70,24 @@ func initAWS() {
 			return
 		}
 		region = cfg.Region
-		sfnClient = sfn.NewFromConfig(cfg)
-		ddbClient = dynamodb.NewFromConfig(cfg)
+		sqsClient = sqs.NewFromConfig(cfg)
 	})
 }
 
 func handler(ctx context.Context, event events.SQSEvent) error {
+	initAWS()
 	if initErr != nil {
 		return initErr
 	}
-	tableName := strings.TrimSpace(os.Getenv("TABLE_NAME"))
-	if tableName == "" {
-		return errors.New("missing env TABLE_NAME")
+	receiveQueueURL := strings.TrimSpace(os.Getenv("RECEIVE_QUEUE_URL"))
+	if receiveQueueURL == "" {
+		return errors.New("missing env RECEIVE_QUEUE_URL")
 	}
+	receiveQueueName := queueNameFromURL(receiveQueueURL)
 
 	for _, record := range event.Records {
 		// 每条 record 对应一条 SQS message。
-		queueName := queueNameFromArn(record.EventSourceARN)
+		pushQueueName := queueNameFromArn(record.EventSourceARN)
 
 		var body msgBody
 		if err := json.Unmarshal([]byte(record.Body), &body); err != nil {
@@ -97,52 +96,49 @@ func handler(ctx context.Context, event events.SQSEvent) error {
 		if strings.TrimSpace(body.ID) == "" {
 			return errors.New("missing id in message body")
 		}
-		if strings.TrimSpace(body.TaskToken) == "" {
-			return errors.New("missing taskToken in message body")
+		if strings.TrimSpace(body.RunID) == "" {
+			return errors.New("missing runId in message body")
 		}
 
-		// receiveUnixNano：Worker 实际接收到消息并准备落库的时间戳。
-		receiveUnixNano := time.Now().UnixNano()
+		// workerReceiveUnixNano：Worker 实际开始处理的时间戳。
+		workerReceiveUnixNano := time.Now().UnixNano()
 
 		// SQS 属性时间戳（毫秒）
 		sqsSentTimestampMs := parseInt64OrZero(record.Attributes["SentTimestamp"])
 		sqsFirstReceiveTimestampMs := parseInt64OrZero(record.Attributes["ApproximateFirstReceiveTimestamp"])
 		sqsApproxReceiveCount := parseInt64OrZero(record.Attributes["ApproximateReceiveCount"])
 
-		// DynamoDB 条件更新：用于演示“只有当 status 不存在或为 pending 才更新”。
-		if err := performConditionalUpdate(ctx, tableName, body.ID, receiveUnixNano); err != nil {
-			// 条件不满足或更新失败不阻断主流程：仍然返回计时结果。
-			log.Printf("ddb conditional update failed id=%s: %v", body.ID, err)
-		}
-
-		// Worker 输出：回调 Step Functions，解除 waitForTaskToken。
 		workerDoneUnixNano := time.Now().UnixNano()
-		callbackRequestUnixNano := time.Now().UnixNano()
-		outBytes, err := json.Marshal(callbackOutput{
-			ID:        body.ID,
-			RunID:     body.RunID,
-			QueueName: queueName,
-			Region:    region,
-			SendUnixNano:            body.SendUnixNano,
-			SendStartUnixNano:       body.SendStartUnixNano,
-			ReceiveUnixNano:         receiveUnixNano,
-			WorkerDoneUnixNano:      workerDoneUnixNano,
-			CallbackRequestUnixNano: callbackRequestUnixNano,
+		callbackSendStartUnixNano := time.Now().UnixNano()
+		cbBytes, err := json.Marshal(callbackMessage{
+			ID:                         body.ID,
+			RunID:                      body.RunID,
+			Region:                     region,
+			PushQueueName:              pushQueueName,
+			ReceiveQueueName:           receiveQueueName,
+			SendUnixNano:               body.SendUnixNano,
+			SendStartUnixNano:          body.SendStartUnixNano,
+			WorkerReceiveUnixNano:      workerReceiveUnixNano,
+			WorkerDoneUnixNano:         workerDoneUnixNano,
+			CallbackSendStartUnixNano:  callbackSendStartUnixNano,
 			SqsSentTimestampMs:         sqsSentTimestampMs,
 			SqsFirstReceiveTimestampMs: sqsFirstReceiveTimestampMs,
 			SqsApproxReceiveCount:      sqsApproxReceiveCount,
 		})
 		if err != nil {
-			return fmt.Errorf("marshal callback output: %w", err)
+			return fmt.Errorf("marshal callback message: %w", err)
 		}
-		_, err = sfnClient.SendTaskSuccess(ctx, &sfn.SendTaskSuccessInput{
-			TaskToken: aws.String(body.TaskToken),
-			Output:    aws.String(string(outBytes)),
+		cbBody := string(cbBytes)
+		_, err = sqsClient.SendMessage(ctx, &sqs.SendMessageInput{
+			QueueUrl:    &receiveQueueURL,
+			MessageBody: &cbBody,
 		})
+		callbackSendEndUnixNano := time.Now().UnixNano()
 		if err != nil {
-			return fmt.Errorf("send task success: %w", err)
+			return fmt.Errorf("send callback message: %w", err)
 		}
-		log.Printf("sent task success id=%s queue=%s", body.ID, queueName)
+
+		log.Printf("worker processed id=%s pushQueue=%s workerReceiveUnixNano=%d workerDoneUnixNano=%d callbackQueue=%s callbackSendStartUnixNano=%d callbackSendEndUnixNano=%d", body.ID, pushQueueName, workerReceiveUnixNano, workerDoneUnixNano, receiveQueueName, callbackSendStartUnixNano, callbackSendEndUnixNano)
 	}
 
 	return nil
@@ -168,28 +164,11 @@ func parseInt64OrZero(s string) int64 {
 	return n
 }
 
-func performConditionalUpdate(ctx context.Context, tableName, id string, receiveUnixNano int64) error {
-	_, err := ddbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(tableName),
-		Key: map[string]dynamodbtypes.AttributeValue{
-			"id": &dynamodbtypes.AttributeValueMemberS{Value: id},
-		},
-		UpdateExpression:    aws.String("SET #status = :processing, #receiveTime = :receiveTime"),
-		ConditionExpression: aws.String("attribute_not_exists(#status) OR #status = :pending"),
-		ExpressionAttributeNames: map[string]string{
-			"#status":      "status",
-			"#receiveTime": "receiveUnixNano",
-		},
-		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
-			":processing":  &dynamodbtypes.AttributeValueMemberS{Value: "processing"},
-			":pending":     &dynamodbtypes.AttributeValueMemberS{Value: "pending"},
-			":receiveTime": &dynamodbtypes.AttributeValueMemberN{Value: fmt.Sprintf("%d", receiveUnixNano)},
-		},
-	})
-	return err
+func queueNameFromURL(queueURL string) string {
+	base := strings.SplitN(queueURL, "?", 2)[0]
+	return path.Base(base)
 }
 
 func main() {
-	initAWS()
 	lambda.Start(handler)
 }

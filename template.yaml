@@ -7,12 +7,18 @@ Globals:
     Timeout: 30
     MemorySize: 256
     Architectures:
-      - arm64
+      - !Ref FunctionArchitecture
 
 Parameters:
   StageName:
     Type: String
     Default: dev
+  FunctionArchitecture:
+    Type: String
+    Default: x86_64
+    AllowedValues:
+      - arm64
+      - x86_64
 Resources:
   TestApi:
     Type: AWS::Serverless::Api
@@ -20,21 +26,17 @@ Resources:
       Name: TestServerlessApi
       StageName: !Ref StageName
 
-  TestQueue:
+  PushQueue:
     Type: AWS::SQS::Queue
     Properties:
+      QueueName: TestFastServerlessPush
       VisibilityTimeout: 30
 
-  TestTable:
-    Type: AWS::DynamoDB::Table
+  ReceiveQueue:
+    Type: AWS::SQS::Queue
     Properties:
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: id
-          KeyType: HASH
+      QueueName: TestFastServerlessReceive
+      VisibilityTimeout: 30
 
   DispatcherRole:
     Type: AWS::IAM::Role
@@ -59,7 +61,14 @@ Resources:
                 Action:
                   - sqs:SendMessage
                   - sqs:GetQueueAttributes
-                Resource: !GetAtt TestQueue.Arn
+                Resource: !GetAtt PushQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt ReceiveQueue.Arn
 
   WorkerRole:
     Type: AWS::IAM::Role
@@ -86,26 +95,17 @@ Resources:
                   - sqs:DeleteMessage
                   - sqs:GetQueueAttributes
                   - sqs:ChangeMessageVisibility
-                Resource: !GetAtt TestQueue.Arn
+                Resource: !GetAtt PushQueue.Arn
 
-        - PolicyName: WorkerStepFunctionsCallback
+        - PolicyName: WorkerSqsCallback
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
-                  - states:SendTaskSuccess
-                  - states:SendTaskFailure
-                Resource: "*"
-
-        - PolicyName: WorkerDdbConditionalUpdate
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - dynamodb:UpdateItem
-                Resource: !GetAtt TestTable.Arn
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ReceiveQueue.Arn
 
   DispatcherFunction:
     Type: AWS::Serverless::Function
@@ -114,7 +114,15 @@ Resources:
       PackageType: Image
       Environment:
         Variables:
-          REQUEST_QUEUE_URL: !Ref TestQueue
+          PUSH_QUEUE_URL: !Ref PushQueue
+          RECEIVE_QUEUE_URL: !Ref ReceiveQueue
+      Events:
+        Run:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TestApi
+            Path: /run
+            Method: POST
     Metadata:
       Dockerfile: Dockerfile
       DockerContext: .
@@ -129,12 +137,12 @@ Resources:
       PackageType: Image
       Environment:
         Variables:
-          TABLE_NAME: !Ref TestTable
+          RECEIVE_QUEUE_URL: !Ref ReceiveQueue
       Events:
         QueueEvent:
           Type: SQS
           Properties:
-            Queue: !GetAtt TestQueue.Arn
+            Queue: !GetAtt PushQueue.Arn
             BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
     Metadata:
@@ -144,95 +152,15 @@ Resources:
       DockerBuildArgs:
         GO_MAIN: ./cmd/worker
 
-  TestStateMachine:
-    Type: AWS::Serverless::StateMachine
-    Properties:
-      Type: STANDARD
-      Policies:
-        - LambdaInvokePolicy:
-            FunctionName: !Ref DispatcherFunction
-      Definition:
-        Comment: Invoke Dispatcher; Dispatcher enqueues taskToken; Worker callbacks to resume
-        StartAt: Dispatch
-        States:
-          Dispatch:
-            Type: Task
-            Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
-            Parameters:
-              FunctionName: ${DispatcherFunctionArn}
-              Payload:
-                taskToken.$: $$.Task.Token
-                input.$: $
-            OutputPath: $
-            TimeoutSeconds: 28
-            End: true
-      DefinitionSubstitutions:
-        DispatcherFunctionArn: !GetAtt DispatcherFunction.Arn
-
-  ApiRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: ApiStepFunctionsAccess
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - states:StartExecution
-                Resource: !Ref TestStateMachine
-              - Effect: Allow
-                Action:
-                  - states:DescribeExecution
-                Resource: "*"
-
-  ApiFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      Role: !GetAtt ApiRole.Arn
-      PackageType: Image
-      Timeout: 30
-      Environment:
-        Variables:
-          STATE_MACHINE_ARN: !Ref TestStateMachine
-      Events:
-        Run:
-          Type: Api
-          Properties:
-            RestApiId: !Ref TestApi
-            Path: /run
-            Method: POST
-    Metadata:
-      Dockerfile: Dockerfile
-      DockerContext: .
-      DockerTag: api
-      DockerBuildArgs:
-        GO_MAIN: ./cmd/api
-
 Outputs:
-  QueueUrl:
-    Value: !Ref TestQueue
-
-  TableName:
-    Value: !Ref TestTable
+  PushQueueUrl:
+    Value: !Ref PushQueue
+  ReceiveQueueUrl:
+    Value: !Ref ReceiveQueue
   DispatcherFunctionName:
     Value: !Ref DispatcherFunction
   WorkerFunctionName:
     Value: !Ref WorkerFunction
-
-  StateMachineArn:
-    Value: !Ref TestStateMachine
 
   ApiEndpoint:
     Value: !Sub "https://${TestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/run"

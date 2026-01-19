@@ -61,7 +61,7 @@ echo "REPEAT=$REPEAT"
 
 # 运行测试并捕获输出，便于将结果块自动写入 result.md。
 TMP_OUT="${TMPDIR:-/tmp}/testsqs-test-output.$$".log
-go test -run TestStepFunctionsFlowLatency -v | tee "$TMP_OUT"
+go test -run TestFastServerlessFlowLatency -v | tee "$TMP_OUT"
 
 RESULT_MD="$ROOT_DIR/result.md"
 EXTRACTED="${TMPDIR:-/tmp}/testsqs-result-block.$$".md

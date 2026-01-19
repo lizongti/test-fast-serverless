@@ -1,11 +1,13 @@
 // Lambda #1 (Dispatcher)
 //
-// 作用：向 SQS 队列发送消息。
-// 触发方式：由测试用例或外部调用通过 aws lambda invoke 远程触发。
-// 输入/输出：返回每条消息的发送时间戳与队列名，供测试用例计算端到端延迟。
+// 作用：API Gateway 后端，向 Push SQS 队列发送请求消息；随后对 Receive SQS 队列做长轮询，
+//
+//	等待 Worker 回写的回调消息并同步返回。
 //
 // 对应 SAM 资源：template.yaml 中的 DispatcherFunction
-// 环境变量：QUEUE_URL（SQS QueueUrl）
+// 环境变量：
+//   - PUSH_QUEUE_URL
+//   - RECEIVE_QUEUE_URL
 package main
 
 import (
@@ -15,41 +17,54 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-type Request struct {
-	TaskToken string `json:"taskToken"`
-	Input     struct {
-		RunID            string `json:"runId,omitempty"`
-		DelaySeconds     int    `json:"delaySeconds,omitempty"`
-		MessageBodyBytes int    `json:"messageBodyBytes,omitempty"`
-	} `json:"input"`
+type apiRequest struct {
+	RunID            string `json:"runId,omitempty"`
+	DelaySeconds     int    `json:"delaySeconds,omitempty"`
+	MessageBodyBytes int    `json:"messageBodyBytes,omitempty"`
+	MaxWaitMs        int    `json:"maxWaitMs,omitempty"`
 }
 
-type Response struct {
-	QueueName string `json:"queueName"`
-	Region    string `json:"region"`
+type apiResponse struct {
+	Status  string          `json:"status"`
+	TotalMs int64           `json:"totalMs"`
+	Output  json.RawMessage `json:"output,omitempty"`
+	Error   string          `json:"error,omitempty"`
+}
 
+type dispatcherOutput struct {
 	RunID string `json:"runId"`
 	ID    string `json:"id"`
 
-	SendUnixNano      int64 `json:"sendUnixNano"`
-	SendStartUnixNano int64 `json:"sendStartUnixNano"`
-	SendEndUnixNano   int64 `json:"sendEndUnixNano"`
+	Region           string `json:"region"`
+	PushQueueName    string `json:"pushQueueName"`
+	ReceiveQueueName string `json:"receiveQueueName"`
 
-	ReceiveUnixNano            int64 `json:"receiveUnixNano"`
+	DispatchStartUnixNano int64 `json:"dispatchStartUnixNano"`
+	SendUnixNano          int64 `json:"sendUnixNano"`
+	SendStartUnixNano     int64 `json:"sendStartUnixNano"`
+	SendEndUnixNano       int64 `json:"sendEndUnixNano"`
+
+	PollStartUnixNano int64 `json:"pollStartUnixNano"`
+	PollEndUnixNano   int64 `json:"pollEndUnixNano"`
+
+	// Worker 回写的时间戳与元数据
+	WorkerReceiveUnixNano      int64 `json:"workerReceiveUnixNano"`
 	WorkerDoneUnixNano         int64 `json:"workerDoneUnixNano"`
-	CallbackRequestUnixNano    int64 `json:"callbackRequestUnixNano"`
+	CallbackSendStartUnixNano  int64 `json:"callbackSendStartUnixNano"`
+	CallbackSendEndUnixNano    int64 `json:"callbackSendEndUnixNano"`
+	ReceiveMessageUnixNano     int64 `json:"receiveMessageUnixNano"`
 	SqsSentTimestampMs         int64 `json:"sqsSentTimestampMs"`
 	SqsFirstReceiveTimestampMs int64 `json:"sqsFirstReceiveTimestampMs"`
 	SqsApproxReceiveCount      int64 `json:"sqsApproxReceiveCount"`
@@ -60,8 +75,28 @@ type msgBody struct {
 	SendUnixNano      int64  `json:"sendUnixNano"`
 	SendStartUnixNano int64  `json:"sendStartUnixNano"`
 	RunID             string `json:"runId"`
-	TaskToken         string `json:"taskToken"`
 	Padding           string `json:"padding,omitempty"`
+}
+
+type callbackMessage struct {
+	ID    string `json:"id"`
+	RunID string `json:"runId"`
+
+	Region           string `json:"region"`
+	PushQueueName    string `json:"pushQueueName"`
+	ReceiveQueueName string `json:"receiveQueueName"`
+
+	SendUnixNano      int64 `json:"sendUnixNano"`
+	SendStartUnixNano int64 `json:"sendStartUnixNano"`
+
+	WorkerReceiveUnixNano     int64 `json:"workerReceiveUnixNano"`
+	WorkerDoneUnixNano        int64 `json:"workerDoneUnixNano"`
+	CallbackSendStartUnixNano int64 `json:"callbackSendStartUnixNano"`
+	CallbackSendEndUnixNano   int64 `json:"callbackSendEndUnixNano"`
+
+	SqsSentTimestampMs         int64 `json:"sqsSentTimestampMs"`
+	SqsFirstReceiveTimestampMs int64 `json:"sqsFirstReceiveTimestampMs"`
+	SqsApproxReceiveCount      int64 `json:"sqsApproxReceiveCount"`
 }
 
 var (
@@ -84,35 +119,96 @@ func initAWS() {
 	})
 }
 
-func handler(ctx context.Context, req Request) (Response, error) {
-	// Standard workflow：状态机使用 waitForTaskToken；Dispatcher 只负责把 taskToken 放进请求队列，Worker 处理后回调解除阻塞。
-	requestQueueURL := os.Getenv("REQUEST_QUEUE_URL")
-	if requestQueueURL == "" {
-		return Response{}, errors.New("missing env REQUEST_QUEUE_URL")
+func jsonResp(status int, v any) (events.APIGatewayProxyResponse, error) {
+	b, _ := json.Marshal(v)
+	return events.APIGatewayProxyResponse{
+		StatusCode: status,
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		Body: string(b),
+	}, nil
+}
+
+func clampInt(v, minV, maxV int) int {
+	if v < minV {
+		return minV
 	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func effectiveTimeout(ctx context.Context, requested time.Duration) time.Duration {
+	// API Gateway 最大 29s；本函数 Timeout 30s；默认目标：25s。
+	if requested <= 0 {
+		requested = 25 * time.Second
+	}
+	if requested > 28*time.Second {
+		requested = 28 * time.Second
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return requested
+	}
+	remaining := time.Until(deadline) - 250*time.Millisecond
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining < requested {
+		return remaining
+	}
+	return requested
+}
+
+func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	initAWS()
 	if initErr != nil {
-		return Response{}, initErr
-	}
-	if strings.TrimSpace(req.TaskToken) == "" {
-		return Response{}, errors.New("missing taskToken in request")
-	}
-	if req.Input.DelaySeconds < 0 {
-		req.Input.DelaySeconds = 0
-	}
-	if req.Input.DelaySeconds > 900 {
-		req.Input.DelaySeconds = 900
-	}
-	if req.Input.MessageBodyBytes < 0 {
-		req.Input.MessageBodyBytes = 0
-	}
-	if strings.TrimSpace(req.Input.RunID) == "" {
-		req.Input.RunID = randHex(12)
+		return jsonResp(500, apiResponse{Status: "ERROR", Error: initErr.Error()})
 	}
 
-	qn := queueNameFromURL(requestQueueURL)
+	pushQueueURL := strings.TrimSpace(os.Getenv("PUSH_QUEUE_URL"))
+	if pushQueueURL == "" {
+		return jsonResp(500, apiResponse{Status: "ERROR", Error: "missing env PUSH_QUEUE_URL"})
+	}
+	receiveQueueURL := strings.TrimSpace(os.Getenv("RECEIVE_QUEUE_URL"))
+	if receiveQueueURL == "" {
+		return jsonResp(500, apiResponse{Status: "ERROR", Error: "missing env RECEIVE_QUEUE_URL"})
+	}
 
-	// 生成消息体：包含唯一 id、发送时间戳；Worker 处理后把结果发回 response queue。
+	var body apiRequest
+	if strings.TrimSpace(req.Body) != "" {
+		if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
+			return jsonResp(400, apiResponse{Status: "ERROR", Error: fmt.Sprintf("invalid json body: %v", err)})
+		}
+	}
+	if strings.TrimSpace(body.RunID) == "" {
+		body.RunID = fmt.Sprintf("run-%d", time.Now().UnixNano())
+	}
+	body.DelaySeconds = clampInt(body.DelaySeconds, 0, 900)
+	if body.MessageBodyBytes < 0 {
+		body.MessageBodyBytes = 0
+	}
+
+	maxWait := 25 * time.Second
+	if body.MaxWaitMs > 0 {
+		maxWait = time.Duration(body.MaxWaitMs) * time.Millisecond
+	}
+	maxWait = effectiveTimeout(ctx, maxWait)
+	if maxWait <= 0 {
+		return jsonResp(504, apiResponse{Status: "TIMEOUT", Error: "deadline too close"})
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+
+	pushQueueName := queueNameFromURL(pushQueueURL)
+	receiveQueueName := queueNameFromURL(receiveQueueURL)
+
 	messageID := randHex(16)
+	dispatchStart := time.Now().UnixNano()
 	sendUnixNano := time.Now().UnixNano()
 	sendStart := time.Now().UnixNano()
 
@@ -120,35 +216,111 @@ func handler(ctx context.Context, req Request) (Response, error) {
 		ID:                messageID,
 		SendUnixNano:      sendUnixNano,
 		SendStartUnixNano: sendStart,
-		RunID:             req.Input.RunID,
-		TaskToken:         req.TaskToken,
-		Padding:           makePadding(req.Input.MessageBodyBytes),
+		RunID:             body.RunID,
+		Padding:           makePadding(body.MessageBodyBytes),
 	}
 	bodyBytes, _ := json.Marshal(bodyObj)
-	body := string(bodyBytes)
 
-	_, err := sqsClient.SendMessage(ctx, &sqs.SendMessageInput{
-		QueueUrl:     &requestQueueURL,
-		MessageBody:  &body,
-		DelaySeconds: int32(req.Input.DelaySeconds),
+	_, err := sqsClient.SendMessage(callCtx, &sqs.SendMessageInput{
+		QueueUrl:     &pushQueueURL,
+		MessageBody:  awsString(string(bodyBytes)),
+		DelaySeconds: int32(body.DelaySeconds),
 	})
 	sendEnd := time.Now().UnixNano()
 	if err != nil {
-		return Response{}, fmt.Errorf("send message: %w", err)
+		return jsonResp(502, apiResponse{Status: "ERROR", Error: fmt.Sprintf("send message: %v", err)})
 	}
 
-	// Lambda 日志：便于排查（测试日志仍由测试用例输出）。
-	log.Printf("sent request id=%s queue=%s sendUnixNano=%d sendStartUnixNano=%d sendEndUnixNano=%d", messageID, qn, sendUnixNano, sendStart, sendEnd)
+	pollStart := time.Now().UnixNano()
+	cb, receiveMessageUnixNano, pollEnd, err := pollForCallback(callCtx, receiveQueueURL, body.RunID, messageID)
+	if err != nil {
+		elapsed := (time.Now().UnixNano() - dispatchStart) / int64(time.Millisecond)
+		code := 500
+		status := "ERROR"
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			code = 504
+			status = "TIMEOUT"
+		}
+		return jsonResp(code, apiResponse{Status: status, TotalMs: elapsed, Error: err.Error()})
+	}
 
-	return Response{
-		QueueName:         qn,
-		Region:            awsCfg.Region,
-		RunID:             req.Input.RunID,
-		ID:                messageID,
-		SendUnixNano:      sendUnixNano,
-		SendStartUnixNano: sendStart,
-		SendEndUnixNano:   sendEnd,
-	}, nil
+	outBytes, _ := json.Marshal(dispatcherOutput{
+		RunID:                      body.RunID,
+		ID:                         messageID,
+		Region:                     awsCfg.Region,
+		PushQueueName:              pushQueueName,
+		ReceiveQueueName:           receiveQueueName,
+		DispatchStartUnixNano:      dispatchStart,
+		SendUnixNano:               sendUnixNano,
+		SendStartUnixNano:          sendStart,
+		SendEndUnixNano:            sendEnd,
+		PollStartUnixNano:          pollStart,
+		PollEndUnixNano:            pollEnd,
+		ReceiveMessageUnixNano:     receiveMessageUnixNano,
+		WorkerReceiveUnixNano:      cb.WorkerReceiveUnixNano,
+		WorkerDoneUnixNano:         cb.WorkerDoneUnixNano,
+		CallbackSendStartUnixNano:  cb.CallbackSendStartUnixNano,
+		CallbackSendEndUnixNano:    cb.CallbackSendEndUnixNano,
+		SqsSentTimestampMs:         cb.SqsSentTimestampMs,
+		SqsFirstReceiveTimestampMs: cb.SqsFirstReceiveTimestampMs,
+		SqsApproxReceiveCount:      cb.SqsApproxReceiveCount,
+	})
+
+	elapsedMs := (time.Now().UnixNano() - dispatchStart) / int64(time.Millisecond)
+	return jsonResp(200, apiResponse{Status: "OK", TotalMs: elapsedMs, Output: outBytes})
+}
+
+func awsString(s string) *string { return &s }
+
+func pollForCallback(ctx context.Context, receiveQueueURL string, runID string, id string) (callbackMessage, int64, int64, error) {
+	for {
+		if ctx.Err() != nil {
+			return callbackMessage{}, 0, 0, ctx.Err()
+		}
+		out, err := sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+			QueueUrl:            &receiveQueueURL,
+			MaxNumberOfMessages: 1,
+			WaitTimeSeconds:     20,
+			VisibilityTimeout:   10,
+		})
+		pollEnd := time.Now().UnixNano()
+		if err != nil {
+			return callbackMessage{}, 0, pollEnd, fmt.Errorf("receive message: %w", err)
+		}
+		if len(out.Messages) == 0 {
+			continue
+		}
+		m := out.Messages[0]
+		receiveMessageUnixNano := time.Now().UnixNano()
+
+		var cb callbackMessage
+		if m.Body != nil {
+			if err := json.Unmarshal([]byte(*m.Body), &cb); err != nil {
+				// 无法解析的消息：不阻塞；删除避免毒消息反复出现。
+				if m.ReceiptHandle != nil {
+					_, _ = sqsClient.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: &receiveQueueURL, ReceiptHandle: m.ReceiptHandle})
+				}
+				continue
+			}
+		}
+
+		if strings.TrimSpace(cb.RunID) == runID && strings.TrimSpace(cb.ID) == id {
+			if m.ReceiptHandle != nil {
+				_, _ = sqsClient.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: &receiveQueueURL, ReceiptHandle: m.ReceiptHandle})
+			}
+			return cb, receiveMessageUnixNano, pollEnd, nil
+		}
+
+		// 非本次请求的回调：不删除，立即释放可见性，避免影响并发请求。
+		if m.ReceiptHandle != nil {
+			_, _ = sqsClient.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+				QueueUrl:          &receiveQueueURL,
+				ReceiptHandle:     m.ReceiptHandle,
+				VisibilityTimeout: 0,
+			})
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func queueNameFromURL(queueURL string) string {
@@ -174,6 +346,5 @@ func randHex(n int) string {
 }
 
 func main() {
-	initAWS()
 	lambda.Start(handler)
 }

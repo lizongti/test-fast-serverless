@@ -20,7 +20,12 @@
 - 在测试日志中增加每条消息发送和接收的时间戳和消息队列名字。
 - 将 AWS SDK 客户端移到 handler 外部初始化，可减少热启动时的开销。
 - 参照现有代码的风格进行编写，包括命名规范、错误处理和日志记录等。新生成代码以后，删除多余文件。
-- 命令约定：Windows 平台下统一使用 WSL（bash）；macOS 平台下统一使用 zsh。
+
+## 执行约定
+
+- Windows 平台下统一使用 WSL（wsl.exe -e bash -lc）；macOS 平台下统一使用 zsh。
+- 允许根据需求创建所需的AWS资源
+- 需要自行调用sam build && sam deploy && ./tests.sh完成测试
 
 ## 测试用例
 

@@ -16,7 +16,8 @@ ARG TARGETARCH
 # SAM Image functions can pass this via Metadata.DockerBuildArgs.GO_MAIN.
 ARG GO_MAIN=./cmd/dispatcher
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} \
+# Default to amd64 (x86_64). SAM/CI may not always pass TARGETARCH into the build stage.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" -o /out/bootstrap ${GO_MAIN}
 
 FROM public.ecr.aws/lambda/provided:al2

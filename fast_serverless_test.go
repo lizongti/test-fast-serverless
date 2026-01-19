@@ -19,27 +19,33 @@ import (
 )
 
 type execOutput struct {
-	ID                      string `json:"id"`
-	RunID                   string `json:"runId"`
-	QueueName               string `json:"queueName"`
-	SendUnixNano            int64  `json:"sendUnixNano"`
-	SendStartUnixNano       int64  `json:"sendStartUnixNano"`
-	ReceiveUnixNano         int64  `json:"receiveUnixNano"`
-	WorkerDoneUnixNano      int64  `json:"workerDoneUnixNano"`
-	CallbackRequestUnixNano int64  `json:"callbackRequestUnixNano"`
+	ID               string `json:"id"`
+	RunID            string `json:"runId"`
+	Region           string `json:"region"`
+	PushQueueName    string `json:"pushQueueName"`
+	ReceiveQueueName string `json:"receiveQueueName"`
 
-	SqsSentTimestampMs         int64  `json:"sqsSentTimestampMs"`
-	SqsFirstReceiveTimestampMs int64  `json:"sqsFirstReceiveTimestampMs"`
-	SqsApproxReceiveCount      int64  `json:"sqsApproxReceiveCount"`
-	Region                     string `json:"region"`
+	DispatchStartUnixNano  int64 `json:"dispatchStartUnixNano"`
+	SendUnixNano           int64 `json:"sendUnixNano"`
+	SendStartUnixNano      int64 `json:"sendStartUnixNano"`
+	SendEndUnixNano        int64 `json:"sendEndUnixNano"`
+	PollStartUnixNano      int64 `json:"pollStartUnixNano"`
+	PollEndUnixNano        int64 `json:"pollEndUnixNano"`
+	ReceiveMessageUnixNano int64 `json:"receiveMessageUnixNano"`
+
+	WorkerReceiveUnixNano int64 `json:"workerReceiveUnixNano"`
+	WorkerDoneUnixNano    int64 `json:"workerDoneUnixNano"`
+
+	SqsSentTimestampMs         int64 `json:"sqsSentTimestampMs"`
+	SqsFirstReceiveTimestampMs int64 `json:"sqsFirstReceiveTimestampMs"`
+	SqsApproxReceiveCount      int64 `json:"sqsApproxReceiveCount"`
 }
 
 type apiResponse struct {
-	ExecutionArn string          `json:"executionArn,omitempty"`
-	Status       string          `json:"status"`
-	TotalMs      int64           `json:"totalMs"`
-	Output       json.RawMessage `json:"output,omitempty"`
-	Error        string          `json:"error,omitempty"`
+	Status  string          `json:"status"`
+	TotalMs int64           `json:"totalMs"`
+	Output  json.RawMessage `json:"output,omitempty"`
+	Error   string          `json:"error,omitempty"`
 }
 
 func callRunAPI(ctx context.Context, apiEndpoint string, payload any, timeout time.Duration) (apiResponse, error) {
@@ -83,13 +89,13 @@ func callRunAPI(ctx context.Context, apiEndpoint string, payload any, timeout ti
 	if err := json.Unmarshal(bodyBytes, &out); err != nil {
 		return apiResponse{}, fmt.Errorf("unmarshal response: %w (body=%s)", err, string(bodyBytes))
 	}
-	if out.Status == "ERROR" && out.Error != "" {
+	if (out.Status == "ERROR" || out.Status == "TIMEOUT") && out.Error != "" {
 		return out, fmt.Errorf("api error: %s", out.Error)
 	}
 	return out, nil
 }
 
-func TestStepFunctionsFlowLatency(t *testing.T) {
+func TestFastServerlessFlowLatency(t *testing.T) {
 	if os.Getenv("RUN_REMOTE_TESTS") != "1" {
 		t.Skip("set RUN_REMOTE_TESTS=1 to run remote AWS test")
 	}
@@ -107,11 +113,6 @@ func TestStepFunctionsFlowLatency(t *testing.T) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		t.Fatalf("load aws config: %v", err)
-	}
-
-	stateMachineArn, err := resolveStackOutput(ctx, cfg, stackName, "StateMachineArn")
-	if err != nil {
-		t.Fatalf("resolve StateMachineArn: %v", err)
 	}
 
 	apiEndpoint, err := resolveStackOutput(ctx, cfg, stackName, "ApiEndpoint")
@@ -153,28 +154,26 @@ func TestStepFunctionsFlowLatency(t *testing.T) {
 		apiOut, err := callRunAPI(ctx, apiEndpoint, map[string]any{
 			"runId":            runID,
 			"messageBodyBytes": 0,
-			// 避免 API Gateway 29s 超时；默认由 ApiFunction 控制为 25s。
+			// 避免 API Gateway 29s 超时；Dispatcher 默认控制为 25s。
 			"maxWaitMs": 25000,
 		}, 28*time.Second)
 		if err != nil {
 			t.Fatalf("call api [%d/%d]: %v", i+1, repeat, err)
 		}
-		if apiOut.Status != "SUCCEEDED" {
-			t.Fatalf("api status not succeeded [%d/%d]: status=%s error=%s", i+1, repeat, apiOut.Status, apiOut.Error)
-		}
-		execArn := apiOut.ExecutionArn
-		if execArn == "" {
-			t.Fatalf("api missing executionArn [%d/%d]", i+1, repeat)
+		if apiOut.Status != "OK" {
+			t.Fatalf("api status not ok [%d/%d]: status=%s error=%s", i+1, repeat, apiOut.Status, apiOut.Error)
 		}
 		var output execOutput
 		if len(apiOut.Output) > 0 {
 			_ = json.Unmarshal(apiOut.Output, &output)
 		}
 
+		t.Logf("iter=%d send queue=%s sendStartUnixNano=%d sendEndUnixNano=%d id=%s", i+1, output.PushQueueName, output.SendStartUnixNano, output.SendEndUnixNano, output.ID)
+		t.Logf("iter=%d recv queue=%s receiveMessageUnixNano=%d workerReceiveUnixNano=%d workerDoneUnixNano=%d", i+1, output.ReceiveQueueName, output.ReceiveMessageUnixNano, output.WorkerReceiveUnixNano, output.WorkerDoneUnixNano)
+
 		wallMs := time.Since(startWall).Milliseconds()
 
-		// Express + StartSyncExecution：直接以 API Lambda 侧测得的等待时间作为总耗时。
-		// 退化：如果 apiOut.TotalMs 不可用，则用墙钟时间。
+		// Dispatcher API：以返回的 TotalMs 作为总耗时；退化时用墙钟时间。
 		latencyMs := apiOut.TotalMs
 		if latencyMs <= 0 {
 			latencyMs = wallMs
@@ -188,34 +187,30 @@ func TestStepFunctionsFlowLatency(t *testing.T) {
 			maxMs = latencyMs
 		}
 
-		// 分布计时：不再依赖 DynamoDB；全部由“消息 + Worker Output”携带的时间戳计算。
-		sqsSentUnixNano := output.SqsSentTimestampMs * int64(time.Millisecond)
-
+		// 分布计时：全部来自回调消息中的时间戳。
 		sendToSqsMs := int64(0)
-		if output.SendStartUnixNano > 0 && sqsSentUnixNano > 0 {
-			sendToSqsMs = nanosToMs(sqsSentUnixNano - output.SendStartUnixNano)
+		if output.SendEndUnixNano > 0 && output.SendStartUnixNano > 0 {
+			sendToSqsMs = nanosToMs(output.SendEndUnixNano - output.SendStartUnixNano)
 			if sendToSqsMs < 0 {
 				sendToSqsMs = 0
 			}
 		}
 
 		sqsWaitMs := int64(0)
-		if output.ReceiveUnixNano > 0 {
-			base := sqsSentUnixNano
-			if base <= 0 {
-				base = output.SendUnixNano
-			}
-			if base > 0 {
-				sqsWaitMs = nanosToMs(output.ReceiveUnixNano - base)
-				if sqsWaitMs < 0 {
-					sqsWaitMs = 0
-				}
+		base := output.SendEndUnixNano
+		if base <= 0 {
+			base = output.SendUnixNano
+		}
+		if output.WorkerReceiveUnixNano > 0 && base > 0 {
+			sqsWaitMs = nanosToMs(output.WorkerReceiveUnixNano - base)
+			if sqsWaitMs < 0 {
+				sqsWaitMs = 0
 			}
 		}
 
 		workerMs := int64(0)
-		if output.WorkerDoneUnixNano > 0 && output.ReceiveUnixNano > 0 {
-			workerMs = nanosToMs(output.WorkerDoneUnixNano - output.ReceiveUnixNano)
+		if output.WorkerDoneUnixNano > 0 && output.WorkerReceiveUnixNano > 0 {
+			workerMs = nanosToMs(output.WorkerDoneUnixNano - output.WorkerReceiveUnixNano)
 			if workerMs < 0 {
 				workerMs = 0
 			}
@@ -346,7 +341,7 @@ func TestStepFunctionsFlowLatency(t *testing.T) {
 
 	// 输出：Markdown（写 stdout，避免 go test 为 log 行追加缩进/前缀导致表格看起来不整齐，也便于脚本提取写入 result.md）。
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "stateMachine=%s\napi=%s\n\n", stateMachineArn, apiEndpoint)
+	fmt.Fprintf(&buf, "api=%s\n\n", apiEndpoint)
 
 	buf.WriteString("### Latency Breakdown (ms)\n\n")
 	breakdownHeaders := []string{"iter", "totalMs", "sendToSqsMs", "sqsWaitMs", "workerMs", "overheadMs", "wallMs", "apiLambdaMs"}

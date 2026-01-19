@@ -1,10 +1,7 @@
-// Lambda (API Handler)
-//
-// 作用：作为 API Gateway 的后端处理器，启动 Step Functions 执行并同步等待完成后返回。
-// 链路：Client -> API Gateway -> ApiFunction -> Step Functions -> Dispatcher -> SQS -> Worker -> (callback) -> Step Functions -> ApiFunction 返回
-//
-// 环境变量：STATE_MACHINE_ARN（Step Functions State Machine ARN）
-// 对应 SAM 资源：template.yaml 中的 ApiFunction
+//go:build ignore
+
+// 该目录曾用于 Step Functions 版本的 ApiFunction。
+// 当前实现按需求改为“API Gateway -> Dispatcher（同步长轮询 Receive SQS）”，因此此文件不再参与构建。
 package main
 
 import (
@@ -22,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
-	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 )
 
 type apiRequest struct {

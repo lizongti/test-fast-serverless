@@ -217,3 +217,44 @@ api=https://zdkkgjqxlk.execute-api.ap-east-1.amazonaws.com/dev/run
 | avg    | 292.800 |       6.200 |    39.900 |    8.800 |    237.900 |
 | min    |     229 |           1 |        35 |        3 |        189 |
 | max    |     613 |          47 |        55 |       56 |        455 |
+
+## Run 2026-01-19T06:21:49Z
+
+api=https://zdkkgjqxlk.execute-api.ap-east-1.amazonaws.com/dev/run
+
+### Latency Breakdown (ms)
+
+| iter | totalMs | sendToSqsMs | sqsWaitMs | workerMs | overheadMs | wallMs | apiLambdaMs |
+| ---: | ------: | ----------: | --------: | -------: | ---------: | -----: | ----------: |
+|    1 |    2310 |         198 |      1946 |        0 |        166 |   3943 |        2310 |
+|    2 |      41 |           6 |        21 |        0 |         14 |    106 |          41 |
+|    3 |      28 |           5 |        11 |        0 |         12 |     81 |          28 |
+|    4 |      34 |           4 |        19 |        0 |         11 |     91 |          34 |
+|    5 |      29 |           5 |        12 |        0 |         12 |     88 |          29 |
+|    6 |      39 |           6 |        13 |        0 |         20 |    100 |          39 |
+|    7 |      35 |          11 |        12 |        0 |         12 |     87 |          35 |
+|    8 |      40 |           6 |        11 |        0 |         23 |     90 |          40 |
+|    9 |      23 |           4 |         9 |        0 |         10 |     81 |          23 |
+|   10 |      27 |           4 |         7 |        0 |         16 |     89 |          27 |
+
+### Cold Start (iter=1)
+
+| iter | totalMs | sendToSqsMs | sqsWaitMs | workerMs | overheadMs | wallMs | apiLambdaMs |
+| ---: | ------: | ----------: | --------: | -------: | ---------: | -----: | ----------: |
+|    1 |    2310 |         198 |      1946 |        0 |        166 |   3943 |        2310 |
+
+### Warm Summary (iter=2..N)
+
+| metric | totalMs | sendToSqsMs | sqsWaitMs | workerMs | overheadMs |
+| ------ | ------: | ----------: | --------: | -------: | ---------: |
+| avg    |  32.889 |       5.667 |    12.778 |    0.000 |     14.444 |
+| min    |      23 |           4 |         7 |        0 |         10 |
+| max    |      41 |          11 |        21 |        0 |         23 |
+
+### All Summary (iter=1..N)
+
+| metric | totalMs | sendToSqsMs | sqsWaitMs | workerMs | overheadMs |
+| ------ | ------: | ----------: | --------: | -------: | ---------: |
+| avg    | 260.600 |      24.900 |   206.100 |    0.000 |     29.600 |
+| min    |      23 |           4 |         7 |        0 |         10 |
+| max    |    2310 |         198 |      1946 |        0 |        166 |

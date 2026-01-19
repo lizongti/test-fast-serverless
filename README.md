@@ -1,17 +1,17 @@
 # TestServerlessSystem
 
-使用 AWS SAM + Go（AWS SDK for Go v2）部署一个 SQS 队列、Step Functions 状态机，以及两类 Lambda：
+使用 AWS SAM + Go（AWS SDK for Go v2）部署两个 SQS 队列与两类 Lambda：
 
-- Dispatcher Lambda：被 Step Functions 调用，将 `taskToken` + 请求参数打包后发送到 SQS 请求队列
-- Worker Lambda：由 SQS 触发，消费请求消息，执行处理逻辑（含一次 DynamoDB 条件更新），然后调用 `SendTaskSuccess/Failure` 回调 Step Functions（回调 Output 中包含各阶段时间戳，用于分布计时）
+- Dispatcher Lambda：由 API Gateway 触发，向 Push 队列发送请求消息；随后长轮询 Receive 队列等待回调消息并同步返回
+- Worker Lambda：由 Push 队列触发，消费请求消息并向 Receive 队列发送回调消息（回调中包含各阶段时间戳，用于分布计时）
 
-测试用例通过“启动 Step Functions 执行并等待完成（顺序执行 10 次）”的方式，测量整条链路的端到端响应时间；并在日志中记录每条消息的发送/接收时间戳与队列名。
+测试用例通过“调用 API 并顺序执行 10 次”的方式，测量端到端响应时间；并在测试日志中记录每条消息发送/接收的时间戳与队列名。
 
 ## 项目结构
 
 - `cmd/dispatcher/main.go`：Dispatcher Lambda（Go）
 - `cmd/worker/main.go`：Worker Lambda（Go）
-- `stepfunctions_test.go`：远程测试用例（Go test）
+- `fast_serverless_test.go`：远程测试用例（Go test）
 - `tests.sh`：便捷测试脚本（设置 env 后执行 go test）
 
 ## 架构
@@ -19,30 +19,27 @@
 ```mermaid
 flowchart LR
   Client[Client] -->|HTTP POST /run| APIGW[API Gateway]
-  APIGW -->|Invoke| API[Lambda: ApiFunction]
-  API -->|StartExecution| SFN[Step Functions: Standard State Machine]
-  API -->|DescribeExecution (poll)| SFN
-  SFN -->|lambda:invoke.waitForTaskToken| Dispatcher[Lambda: Dispatcher]
-  Dispatcher -->|SendMessage (taskToken + request)| SQS[(SQS Queue: RequestQueue)]
-  SQS -->|Trigger| Worker[Lambda: Worker]
-  Worker -->|SendTaskSuccess(Output JSON)| SFN
-  SFN -->|Execution Output| API
+  APIGW -->|Invoke| Dispatcher[Lambda: Dispatcher]
+  Dispatcher -->|SendMessage(request)| PushSQS[(SQS Queue: TestFastServerlessPush)]
+  PushSQS -->|Trigger| Worker[Lambda: Worker]
+  Worker -->|SendMessage(callback)| ReceiveSQS[(SQS Queue: TestFastServerlessReceive)]
+  Dispatcher -->|ReceiveMessage (long poll)| ReceiveSQS
+  Dispatcher -->|HTTP 200| Client
 
   subgraph Region[AWS Region (aws_region)]
     APIGW
-    API
-    SFN
     Dispatcher
-    SQS
+    PushSQS
+    ReceiveSQS
     Worker
   end
 ```
 
 说明：该项目只要求同一个 AWS Region（`aws_region`），因此模板不强制引入 VPC/子网等网络约束。
 
-注意：`AWS_REGION` 属于 Lambda 保留环境变量，模板里不能显式设置；SDK 会从运行时环境自动获取。
+注意：`AWS_REGION` 属于 Lambda 保留环境变量，SDK 会从运行时环境自动获取。
 
-注意：模板不再强制固定 SQS/StateMachine 名称，避免同一账号/region 下多次部署时发生名称冲突。
+注意：本项目按需求固定队列名称：`TestFastServerlessPush` 与 `TestFastServerlessReceive`。
 
 ## 前置条件
 
@@ -89,13 +86,13 @@ chmod +x ./tests.sh
 也可以直接用 `go test`（远程测试默认是 **skip**，需要显式设置 `RUN_REMOTE_TESTS=1`）：
 
 ```bash
-RUN_REMOTE_TESTS=1 STAGE=dev REPEAT=10 go test -run TestStepFunctionsFlowLatency -v
+RUN_REMOTE_TESTS=1 STAGE=dev REPEAT=10 go test -run TestFastServerlessFlowLatency -v
 ```
 
 自定义 stack 与次数：
 
 ```bash
-RUN_REMOTE_TESTS=1 STACK_NAME=testsqs-dev REPEAT=50 go test -run TestServerlessLatency -v
+RUN_REMOTE_TESTS=1 STACK_NAME=testsqs-dev REPEAT=50 go test -run TestFastServerlessFlowLatency -v
 ```
 
 ## 测试日志输出

@@ -2,7 +2,7 @@
 
 ## 设计目标
 
-- 创建一个 Dispatcher Lambda 函数，用于向 Push SQS 队列发送数据,发送完成以后，监听Receive SQS队列
+- 创建一个 Dispatcher Lambda 函数，用于向 Push SQS 队列发送数据,发送完成以后，使用长轮询监听Receive SQS队列
 - 创建一个 Push SQS 队列，名称TestFastServerlessPush，使用 SQS 触发器触发 Worker Lambda 函数
 - 创建一个 Receive SQS 队列，名称TestFastServerlessReceive，用于接收 Worker Lambda 函数处理完成后的回调消息，没有任何触发器。
 - 创建一个 Workder Lambda 函数，消费 Push SQS 消息，处理后向 Receive SQS 队列发送回调消息
